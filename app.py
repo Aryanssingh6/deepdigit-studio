@@ -304,7 +304,6 @@ def page_overview():
 </div>""",
         unsafe_allow_html=True,
     )
-    st.info("👈 Use the sidebar to open any part. Start with **Live Playground** to see all models react to one digit at the same time.")
     with st.expander("About these numbers"):
         st.write(
             "Models in this app were trained with `train_numpy.py`, a NumPy re-implementation of the project's PyTorch script "
@@ -328,7 +327,7 @@ def page_playground():
             if x is None:
                 st.warning("Couldn't find any ink in that image.")
         if x is None:
-            st.stop()
+            return
     seed = st.slider("RBM sampling seed (RBMs sample their hidden units, so every seed gives a slightly different rebuild)", 0, 50, 0)
 
     p = judge(x)[0]
@@ -701,19 +700,14 @@ def page_comparison():
 # ============================================================================= router
 with st.sidebar:
     st.markdown("### 🔢 DeepDigit Studio")
-    page = st.radio("Navigate", PAGES, label_visibility="collapsed")
-    st.divider()
     st.caption("Aryan Singh · Roll 69 · Batch C4\nDeep Learning II · 2026–27")
     st.caption("NumPy inference · weights from `train_numpy.py`")
 
-{
-    "Overview": page_overview,
-    "Live Playground": page_playground,
-    "1 · Probability Lab": page_probability,
-    "2 · Autoencoder": page_autoencoder,
-    "3 · Markov Chain": page_markov,
-    "4 · RBM": page_rbm,
-    "5 · GAN": page_gan,
-    "6 · Latent Mixing": page_mixing,
-    "7 · Final Comparison": page_comparison,
-}[page]()
+# Single page: all sections stacked one after another
+for _i, _section in enumerate((
+    page_overview, page_playground, page_probability, page_autoencoder, page_markov,
+    page_rbm, page_gan, page_mixing, page_comparison,
+)):
+    if _i:
+        st.divider()
+    _section()
