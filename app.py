@@ -6,6 +6,7 @@ probability tables, autoencoder, Markov chain, RBM, GAN, latent mixing and the f
 comparison. Inference runs in pure NumPy on weights trained by train_numpy.py, so the
 app starts instantly and needs no GPU / PyTorch.
 """
+import hashlib
 from pathlib import Path
 
 import altair as alt
@@ -17,8 +18,6 @@ from PIL import Image
 ASSETS = Path(__file__).parent / "assets"
 ACCENT, TEAL, VIOLET, ROSE, LIME, MUTED = "#ffb454", "#5ad1c5", "#8b8cf7", "#f0657a", "#9bd36a", "#5b6577"
 SERIES = [ACCENT, TEAL, VIOLET, ROSE, LIME, "#c9a0ff"]
-PAGES = ["Overview", "Live Playground", "1 · Probability Lab", "2 · Autoencoder", "3 · Markov Chain",
-         "4 · RBM", "5 · GAN", "6 · Latent Mixing", "7 · Final Comparison"]
 
 st.set_page_config(page_title="DeepDigit Studio", page_icon="🔢", layout="wide", initial_sidebar_state="expanded")
 
@@ -268,18 +267,83 @@ def simulate(steps, seed):
     return states
 
 
+
+# ----------------------------------------------------------------------------- per-image helpers
+@st.cache_data
+def category_cuts():
+    """Ink terciles and median width, estimated on the 10,000 MNIST test images (same distribution as train)."""
+    q = np.quantile(XTE.sum(1), [1 / 3, 2 / 3])
+    med = float(np.median((XTE.reshape(-1, 28, 28) > 0.3).any(1).sum(1)))
+    return q, med
+
+
+def categorize(x, truth, pred):
+    """Parity / Ink / Width of ONE image, using the same definitions as Part 1."""
+    q, med = category_cuts()
+    digit = int(pred if truth is None else truth)
+    width_cols = int((np.asarray(x).reshape(28, 28) > 0.3).any(0).sum())
+    return {
+        "digit": digit,
+        "from_label": truth is not None,
+        "parity": "Even" if digit % 2 == 0 else "Odd",
+        "ink": ORDER["Ink"][int(np.digitize(float(np.sum(x)), q, right=True))],
+        "ink_sum": float(np.sum(x)),
+        "width": "Wide" if width_cols > med else "Narrow",
+        "width_cols": width_cols,
+    }
+
+
+@st.cache_data
+def gan_pool(n=4000, seed=123):
+    z = np.random.default_rng(seed).standard_normal((n, 100)).astype(np.float32)
+    imgs = generate(z)
+    return imgs, judge(imgs)
+
+
+def input_block():
+    """STEP 1 - choose ONE digit. Everything else in the app runs on it."""
+    page_header("STEP 1 · CHOOSE A DIGIT", "Start with one image",
+                "Pick an MNIST test image or upload your own (an MNIST-style PNG works too). Every section below runs on this one digit.")
+    src = st.radio("Input", ["Pick an MNIST test image", "Upload an image"], horizontal=True, label_visibility="collapsed", key="src_choice")
+    if src == "Pick an MNIST test image":
+        idx = digit_picker("pg", default=7)
+        return XTE[idx], int(YTE[idx]), f"m{idx}", f"MNIST test #{idx}"
+    f = st.file_uploader("Upload a picture of a single handwritten digit (PNG / JPG)", type=["png", "jpg", "jpeg"])
+    st.caption("Tip: dark pen on white paper, or an MNIST-style white-on-black PNG. The image is cropped, resized to 20×20 and centred in 28×28, exactly like MNIST.")
+    if f is None:
+        st.info("⬆️ Upload an image to start — or switch to **Pick an MNIST test image** above.")
+        st.stop()
+    x = preprocess_upload(f)
+    if x is None:
+        st.warning("Couldn't find any ink in that image.")
+        st.stop()
+    return x, None, "u" + hashlib.md5(f.getvalue()).hexdigest()[:10], "Your upload"
+
+
+def section_judge(x, truth):
+    page_header("STEP 2 · THE JUDGE", "What does the judge see?",
+                "The helper classifier (784 → 128 → 10) reads your digit. The same judge later scores every model's output, so this is the yardstick for everything below.")
+    p = judge(x)[0]
+    a, b, c = st.columns([1, 2.2, 1.1])
+    with a:
+        show_digit(x, 170, "Input to every model (28×28 = 784 numbers)")
+    with b:
+        st.altair_chart(bar_probs(p, p.argmax(), height=190), width="stretch")
+    with c:
+        st.metric("Predicted digit", int(p.argmax()), delta=None if truth is None else ("✓ correct" if truth == p.argmax() else f"✗ true label {truth}"), delta_color="off")
+        st.metric("Confidence", f"{p.max() * 100:.1f}%")
+
+
+
 # ============================================================================= PAGES
-def page_overview():
+def hero():
     st.markdown(
         """<div class="hero"><span class="badge">DEEP LEARNING II · MNIST</span>
         <h1>DeepDigit <span>Studio</span></h1>
-        <p>How can a computer learn what data looks like? Seven ideas — probability tables, autoencoders,
-        Markov chains, RBMs, GANs and latent mixing — all run on the same handwritten digits and scored on one scoreboard.</p></div>""",
+        <p>How can a computer learn what data looks like? Choose or upload one digit, then watch probability tables, an autoencoder,
+        a Markov chain, three RBMs, a GAN and latent mixing all react to it — and finish on one scoreboard.</p></div>""",
         unsafe_allow_html=True,
     )
-    first =[int(np.where(YTE == d)[0][0]) for d in range(10)]
-    st.image(grid(XTE[first], 10, scale=6), width="stretch")
-
     m = W["metrics"]
     names = list(W["metrics_names"])
     ae, r256, gan = names.index("Autoencoder-16"), names.index("RBM-256"), names.index("GAN (generated)")
@@ -289,8 +353,8 @@ def page_overview():
     c[2].metric("RBM-256 digit accuracy", f"{m[r256, 1] * 100:.1f}%")
     c[3].metric("GAN mean confidence", f"{m[gan, 2]:.3f}")
 
-    st.subheader("The pipeline")
-    st.markdown(
+    with st.expander("How the pipeline works", expanded=False):
+      st.markdown(
         """
 <div class="flow">
 <div class="card"><b>DATA</b><h4>MNIST</h4><p>70,000 digits, 28×28 px → 784 numbers scaled to 0–1. 60k train / 10k test.</p></div>
@@ -303,7 +367,7 @@ def page_overview():
 <div class="card"><b>PART 6–7</b><h4>Mixing &amp; scoreboard</h4><p>Latent mixing, interpolation and a final same-measure comparison.</p></div>
 </div>""",
         unsafe_allow_html=True,
-    )
+      )
     with st.expander("About these numbers"):
         st.write(
             "Models in this app were trained with `train_numpy.py`, a NumPy re-implementation of the project's PyTorch script "
@@ -312,51 +376,17 @@ def page_overview():
         )
 
 
-def page_playground():
-    page_header("LIVE", "Live Playground", "Pick any MNIST test digit — or upload your own — and watch the judge, the autoencoder and the three RBMs process it at the same time.")
-    src = st.radio("Input", ["MNIST test image", "Upload my own digit"], horizontal=True, label_visibility="collapsed")
-    x, truth = None, None
-    if src == "MNIST test image":
-        idx = digit_picker("pg", default=7)
-        x, truth = XTE[idx], YTE[idx]
-    else:
-        f = st.file_uploader("Upload a picture of a single handwritten digit (PNG / JPG)", type=["png", "jpg", "jpeg"])
-        st.caption("Tip: a dark pen on white paper works best. The image is cropped, resized to 20×20 and centred in 28×28, exactly like MNIST.")
-        if f is not None:
-            x = preprocess_upload(f)
-            if x is None:
-                st.warning("Couldn't find any ink in that image.")
-        if x is None:
-            return
-    seed = st.slider("RBM sampling seed (RBMs sample their hidden units, so every seed gives a slightly different rebuild)", 0, 50, 0)
-
-    p = judge(x)[0]
-    ae = decode(encode(x))[0]
-    rb = {h: rbm_recon(x, h, seed)[0] for h in (64, 128, 256)}
-
-    cols = st.columns([1, 1, 1, 1, 1])
-    items = [("Original", x, None), ("Autoencoder (16-d)", ae, None)] + [(f"RBM-{h}", rb[h], None) for h in rb]
-    for col, (name, img, _) in zip(cols, items):
-        with col:
-            st.markdown(f"**{name}**")
-            show_digit(img, width=140)
-            pr = judge(img)[0]
-            mse = "" if name == "Original" else f"MSE `{np.mean((img - x) ** 2):.4f}` · "
-            st.markdown(f"{mse}judge: **{pr.argmax()}** ({pr.max() * 100:.0f}%)")
-
-    st.subheader("What the judge thinks of the original")
-    left, right = st.columns([2, 1])
-    left.altair_chart(bar_probs(p, p.argmax()), width="stretch")
-    with right:
-        st.metric("Predicted digit", int(p.argmax()), delta=None if truth is None else ("✓ correct" if truth == p.argmax() else f"✗ true label {truth}"),
-                  delta_color="off")
-        st.metric("Confidence", f"{p.max() * 100:.1f}%")
-    st.caption("The autoencoder squeezes the digit into just 16 numbers; each RBM samples a binary hidden code (64/128/256 units) and rebuilds pixel probabilities. A better model keeps the judge's answer unchanged while MSE stays low.")
-
-
-def page_probability():
+def page_probability(me):
     page_header("PART 1 · PRACTICALS 1-3", "Probability Lab", "Every image is turned into simple categories — Parity (from the label), Ink (total brightness in 3 equal groups) and Width (columns containing ink vs. the median). Count co-occurrences, divide by 60,000 and you have a joint distribution.")
     df = prob_frame()
+    st.markdown("##### Where your digit falls")
+    k = st.columns(4)
+    k[0].metric("Digit", me["digit"], "from true label" if me["from_label"] else "from judge's guess", delta_color="off", delta_arrow="off")
+    k[1].metric("Parity", me["parity"])
+    k[2].metric("Ink", me["ink"], f"pixel sum {me['ink_sum']:.1f}", delta_color="off", delta_arrow="off")
+    k[3].metric("Width", me["width"], f"{me['width_cols']} columns with ink", delta_color="off", delta_arrow="off")
+    joint_pi = pd.crosstab(df["Parity"], df["Ink"], normalize=True).reindex(index=ORDER["Parity"], columns=ORDER["Ink"]).fillna(0)
+    st.caption(f"In the training data, P(Parity = {me['parity']}, Ink = {me['ink']}) = **{joint_pi.loc[me['parity'], me['ink']]:.4f}**. The tabs below let you explore every table; the 3-variable tab starts on your digit's cell.")
     tab2, tab3, tab4 = st.tabs(["Two variables", "Three variables", "P(Digit | Ink)"])
 
     with tab2:
@@ -393,8 +423,8 @@ def page_probability():
     with tab3:
         st.markdown("Fix **Parity** and **Ink** and see how the distribution of **Width** changes — the same idea as factorising a joint distribution in a Bayesian / Markov network:  `P(Width | Parity, Ink) = P(Parity, Ink, Width) / P(Parity, Ink)`")
         c = st.columns(2)
-        par = c[0].radio("Parity =", ORDER["Parity"], horizontal=True)
-        ink = c[1].radio("Ink =", ORDER["Ink"], horizontal=True, index=2)
+        par = c[0].radio("Parity =", ORDER["Parity"], horizontal=True, index=ORDER["Parity"].index(me["parity"]), key=f"par_{me['parity']}")
+        ink = c[1].radio("Ink =", ORDER["Ink"], horizontal=True, index=ORDER["Ink"].index(me["ink"]), key=f"ink_{me['ink']}")
         j3 = df.groupby(["Parity", "Ink", "Width"]).size() / len(df)
         sub = j3.loc[(par, ink)].reindex(ORDER["Width"]).fillna(0)
         den = sub.sum()
@@ -407,6 +437,8 @@ def page_probability():
             .encode(x=alt.X("Width:O", axis=alt.Axis(labelAngle=0)), y=alt.Y("P(Width | Parity, Ink):Q", scale=alt.Scale(domain=[0, 1]), title="P(Width | Parity, Ink)"),
                     tooltip=["Width", alt.Tooltip("P(Width | Parity, Ink):Q", format=".4f")]).properties(height=220),
             width="stretch")
+        pw = float(t.loc[t.Width == me["width"], "P(Width | Parity, Ink)"].iloc[0])
+        st.info(f"Your digit is **{me['width']}**. Given the selected Parity and Ink, P(Width = {me['width']}) = **{pw:.4f}**.")
         full = j3.rename("P").reset_index()
         with st.expander("Full 3-variable joint table (12 cells)"):
             st.dataframe(full.style.format({"P": "{:.4f}"}), hide_index=True, width="stretch")
@@ -415,12 +447,12 @@ def page_probability():
         dgi = pd.crosstab(df["Digit"], df["Ink"], normalize="columns").reindex(columns=ORDER["Ink"])
         st.markdown("Which digits use a lot of ink? Each **column** sums to 1 — given the ink level, how likely is each digit?")
         st.altair_chart(heatmap(dgi, "Ink level", "Digit", height=420), width="stretch")
+        st.caption(f"Your digit has **{me['ink']}** ink → P(Digit = {me['digit']} | Ink = {me['ink']}) = **{dgi.loc[me['digit'], me['ink']]:.4f}**.")
 
 
-def page_autoencoder():
+def page_autoencoder(x, truth, imgid):
     page_header("PART 2 · PRACTICAL 6", "Autoencoder", "Encoder: 784 → 128 → 16.  Decoder: 16 → 128 → 784. Forced to rebuild a digit from only 16 numbers (the latent code), the network keeps what matters and drops the rest.")
-    idx = digit_picker("ae", default=0)
-    x = XTE[idx]
+    truth_txt = "unknown (uploaded image)" if truth is None else truth
     z = encode(x)[0]
     rec = decode(z)[0]
     pr = judge(rec)[0]
@@ -437,7 +469,7 @@ def page_autoencoder():
             .encode(x=alt.X("unit:O", sort=list(zdf.unit), title=None, axis=alt.Axis(labelAngle=0)), y=alt.Y("value:Q", title=None),
                     color=alt.condition(alt.datum.value > 0, alt.value(ACCENT), alt.value(TEAL)), tooltip=["unit", alt.Tooltip("value:Q", format=".3f")]).properties(height=170),
             width="stretch")
-        st.markdown(f"MSE `{np.mean((rec - x) ** 2):.4f}` · judge reads the rebuild as **{pr.argmax()}** ({pr.max() * 100:.0f}%) — true label **{YTE[idx]}**")
+        st.markdown(f"MSE `{np.mean((rec - x) ** 2):.4f}` · judge reads the rebuild as **{pr.argmax()}** ({pr.max() * 100:.0f}%) — true label **{truth_txt}**")
 
     st.subheader("Be the decoder")
     st.caption("These sliders start at the encoder's 16 numbers for the chosen digit. Move them and the decoder draws a new image instantly — each number controls some feature of the stroke.")
@@ -447,7 +479,7 @@ def page_autoencoder():
     cols = st.columns(4)
     for j in range(16):
         lo_j, hi_j = float(min(lo[j], z[j])), float(max(hi[j], z[j]))
-        zs[j] = cols[j % 4].slider(f"z{j + 1}", lo_j, hi_j, float(z[j]), step=0.01, key=f"aez_{idx}_{j}")
+        zs[j] = cols[j % 4].slider(f"z{j + 1}", lo_j, hi_j, float(z[j]), step=0.01, key=f"aez_{imgid}_{j}")
     edit = decode(zs)[0]
     pe = judge(edit)[0]
     a, b = st.columns([1, 3])
@@ -462,15 +494,34 @@ def page_autoencoder():
     st.altair_chart(line_chart(loss, "epoch:Q", "MSE loss:Q", "series:N", "Training loss per epoch (10 epochs, Adam lr 1e-3)"), width="stretch")
 
 
-def page_markov():
+def page_markov(x, truth, pred, imgid):
     P, pi, temp = markov_matrix()
     page_header("PART 3 · PRACTICAL 5", "Markov Chain over digits", "The ten digits are the states. Digits whose average latent codes (centroids) are close get a higher chance of following each other: softmax of negative distance, with no self-transitions. Walk the chain long enough and visit frequencies settle to a fixed distribution.")
     protos = decode(W["centroids"])
     st.markdown("##### The 10 states — each digit's centroid, decoded back into an image")
     st.image(grid(protos, 10, scale=6), width="stretch")
 
+    z_me = encode(x)[0]
+    dist_me = np.linalg.norm(W["centroids"] - z_me, axis=1)
+    near = int(dist_me.argmin())
+    st.markdown("##### Where your digit sits among the 10 states")
+    a, b = st.columns([1, 3])
+    with a:
+        show_digit(x, 140, "Your digit")
+    with b:
+        dd = pd.DataFrame({"digit": list(range(10)), "distance": dist_me})
+        st.altair_chart(
+            alt.Chart(dd).mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3).encode(
+                x=alt.X("digit:O", title="Digit state (centroid)", axis=alt.Axis(labelAngle=0)), y=alt.Y("distance:Q", title="Latent distance to centroid"),
+                color=alt.condition(alt.datum.digit == near, alt.value(ACCENT), alt.value(MUTED)),
+                tooltip=["digit:O", alt.Tooltip("distance:Q", format=".3f")]).properties(height=170),
+            width="stretch")
+        st.markdown(f"Its 16-number code is closest to the centroid of **{near}** · the judge reads it as **{pred}**. The walk below starts at state **{pred}**.")
+
     st.subheader("Take a walk, one step at a time")
-    st.session_state.setdefault("mc_hist", [0])
+    if st.session_state.get("mc_for") != imgid:
+        st.session_state.mc_hist = [int(pred)]
+        st.session_state.mc_for = imgid
     st.session_state.setdefault("mc_rng", np.random.default_rng(0))
     b1, b2, b3 = st.columns([1, 1, 4])
     if b1.button("▶ Step", width="stretch"):
@@ -481,7 +532,7 @@ def page_markov():
             cur = st.session_state.mc_hist[-1]
             st.session_state.mc_hist.append(int(st.session_state.mc_rng.choice(10, p=P[cur])))
     if b3.button("↺ Reset"):
-        st.session_state.mc_hist = [0]
+        st.session_state.mc_hist = [int(pred)]
     hist = st.session_state.mc_hist
     cur = hist[-1]
     l, r = st.columns([1.3, 1])
@@ -530,26 +581,31 @@ def page_markov():
     st.caption(f"Temperature used for the softmax = mean off-diagonal centroid distance / 2 = {temp:.3f}. The matrix is a modelling choice, not observed digit sequences.")
 
 
-def page_rbm():
+def page_rbm(x, truth, imgid):
     page_header("PART 4 · PRACTICAL 4", "Restricted Boltzmann Machine", "Visible layer = 784 pixels, hidden layer = 64 / 128 / 256 units, no connections inside a layer. Trained with 1-step contrastive divergence. To rebuild an image: pixels → P(h|v) → sample h → P(v|h).")
-    idx = digit_picker("rbm", default=0)
-    seed = st.slider("Sampling seed", 0, 50, 0, key="rbm_seed")
-    n = st.slider("How many consecutive test digits to show", 5, 16, 10)
-    idxs = np.arange(idx, idx + n) % len(XTE)
-    rows = [XTE[idxs]] + [rbm_recon(XTE[idxs], h, seed) for h in (64, 128, 256)]
-    st.image(grid(np.concatenate(rows), n, scale=5), width="stretch")
-    st.caption("Rows from top: original · RBM-64 · RBM-128 · RBM-256. More hidden units → sharper rebuild.")
-    mse = [float(np.mean((rows[i + 1] - rows[0]) ** 2)) for i in range(3)]
+    seed = st.slider("Sampling seed (first of the shown seeds)", 0, 50, 0, key="rbm_seed")
+    n = st.slider("How many different seeds to show", 4, 12, 8)
+    sizes = (64, 128, 256)
+    recs = {h: np.concatenate([rbm_recon(x, h, seed + s) for s in range(n)]) for h in sizes}
+    l, r = st.columns([1, 5])
+    with l:
+        show_digit(x, 120, "Your digit")
+    with r:
+        st.image(grid(np.concatenate([recs[h] for h in sizes]), n, scale=5), width="stretch")
+    st.caption("Rows from top: RBM-64 · RBM-128 · RBM-256. Each column is a different random seed — the hidden units are sampled, so every rebuild differs slightly.")
+    ref = int(judge(x)[0].argmax())
     c = st.columns(3)
-    for col, h, m_ in zip(c, (64, 128, 256), mse):
-        col.metric(f"RBM-{h} MSE on these {n} digits", f"{m_:.4f}")
+    for col, h in zip(c, sizes):
+        m_ = float(np.mean((recs[h] - x) ** 2))
+        agree = float((judge(recs[h]).argmax(1) == ref).mean())
+        col.metric(f"RBM-{h} · mean MSE over {n} seeds", f"{m_:.4f}", f"judge keeps its answer in {agree * 100:.0f}% of seeds", delta_color="off", delta_arrow="off")
 
     st.subheader("Inside the hidden layer")
     hs = st.radio("Hidden size", [64, 128, 256], horizontal=True, index=1)
-    h, ph = rbm_hidden(XTE[idx], hs, seed)
+    h, ph = rbm_hidden(x, hs, seed)
     a, b = st.columns([1, 1.4])
     with a:
-        st.markdown(f"**Sampled hidden code h** for test image #{idx} (white = unit on)")
+        st.markdown(f"**Sampled hidden code h** for your digit (white = unit on)")
         side = 8 if hs == 64 else 16
         hv = h[0].reshape(-1, side)
         img = Image.fromarray((hv * 255).astype(np.uint8)).resize((hv.shape[1] * 14, hv.shape[0] * 14), Image.NEAREST)
@@ -572,8 +628,25 @@ def page_rbm():
     r.dataframe(tab.style.format("{:.4f}").highlight_min(subset=["MSE", "TV distance"], color="#3a5a2a").highlight_max(subset=["Digit accuracy", "Mean confidence"], color="#3a5a2a"), width="stretch")
 
 
-def page_gan():
+def page_gan(x, truth, pred):
     page_header("PART 5 · PRACTICAL 7", "Generative Adversarial Network", "A generator turns 100 random numbers into a 784-pixel image; a discriminator tries to tell real from fake. Each is trained to beat the other — and the generator slowly learns to draw digits.")
+    pool, pp = gan_pool()
+    near = int(((pool - x) ** 2).mean(1).argmin())
+    same = np.where(pp.argmax(1) == pred)[0]
+    best = same[np.argsort(-pp[same, pred])[:12]]
+    st.markdown("##### The GAN never sees your image — it only draws from noise. So how close can it get?")
+    a, b, c_ = st.columns([1, 1, 4])
+    with a:
+        show_digit(x, 130, "Your digit")
+    with b:
+        show_digit(pool[near], 130, f"Closest of {len(pool):,} GAN images")
+        st.caption(f"MSE {np.mean((pool[near] - x) ** 2):.4f}")
+    with c_:
+        if len(best):
+            st.markdown(f"**The GAN's most convincing '{pred}'s** (judge's top picks among {len(pool):,} samples)")
+            st.image(grid(pool[best], 6, scale=4), width=6 * 4 * 30 + 12)
+        else:
+            st.caption(f"None of the {len(pool):,} GAN samples was read as a {pred} by the judge.")
     t1, t2, t3 = st.tabs(["Generate", "Watch it learn", "Losses"])
     with t1:
         c = st.columns(3)
@@ -606,7 +679,7 @@ def page_gan():
         st.caption("Neither loss goes to zero — that's healthy. If the discriminator won outright, the generator would stop learning.")
 
 
-def page_mixing():
+def page_mixing(x, truth, imgid):
     page_header("PART 6 · PRACTICAL 8", "Latent Mixing", "Practical 8 used StyleGAN2 style-mixing on faces. A plain fully-connected GAN has no separate style layers, so here the idea is shown on a smaller scale: splice two latent codes, or slide smoothly between two real digits.")
     t1, t2 = st.tabs(["GAN: splice two noise vectors", "Autoencoder: interpolate two digits"])
     with t1:
@@ -626,19 +699,14 @@ def page_mixing():
         st.dataframe(pt, width="stretch")
         st.caption("Larger k → more like A, smaller k → more like B, but the change isn't clean: some columns hold the shape of one source, others turn into a different digit. That's expected without style layers.")
     with t2:
-        c = st.columns(2)
-        with c[0]:
-            st.markdown("##### Digit A")
-            ia = digit_picker("mixA", default=3)
-        with c[1]:
-            st.markdown("##### Digit B")
-            ib = digit_picker("mixB", default=8)
+        st.markdown("##### Digit A is **your digit** — pick Digit B (an MNIST test image)")
+        ib = digit_picker("mixB", default=8)
         alpha = st.slider("Blend  α  (0 = A, 1 = B)", 0.0, 1.0, 0.5, 0.01)
-        za_, zb_ = encode(XTE[ia])[0], encode(XTE[ib])[0]
+        za_, zb_ = encode(x)[0], encode(XTE[ib])[0]
         cur = decode((1 - alpha) * za_ + alpha * zb_)[0]
         pc = judge(cur)[0]
         a, b, c2, d_ = st.columns([1, 1, 1, 2])
-        with a: show_digit(XTE[ia], 130, f"A (label {YTE[ia]})")
+        with a: show_digit(x, 130, "A (your digit)")
         with b: show_digit(cur, 130, f"α = {alpha:.2f}")
         with c2: show_digit(XTE[ib], 130, f"B (label {YTE[ib]})")
         with d_:
@@ -650,8 +718,26 @@ def page_mixing():
         st.caption("Ten evenly spaced points on the straight line between the two latent codes, decoded one by one.")
 
 
-def page_comparison():
+def page_comparison(x, truth, pred):
     page_header("PART 7", "Final Comparison", "Every model is scored on the same 2,000 test images with the same four measures. The GAN has no original image to compare with, so only confidence and distribution distance apply to it.")
+    seed = st.session_state.get("rbm_seed", 0)
+    ref = pred if truth is None else int(truth)
+    recs = {"Autoencoder-16": decode(encode(x))[0], **{f"RBM-{h}": rbm_recon(x, h, seed)[0] for h in (64, 128, 256)}}
+    st.markdown("##### How each model did on **your** digit")
+    cols = st.columns(len(recs))
+    rows_me = []
+    for col, (nm, im) in zip(cols, recs.items()):
+        q_ = judge(im)[0]
+        with col:
+            show_digit(im, 120, nm)
+        rows_me.append({"Model": nm, "MSE vs your digit": float(np.mean((im - x) ** 2)), "Judge reads": int(q_.argmax()),
+                        "Confidence": float(q_.max()), "Correct": "✓" if q_.argmax() == ref else "✗"})
+    me_df = pd.DataFrame(rows_me).set_index("Model")
+    st.dataframe(me_df.style.format({"MSE vs your digit": "{:.4f}", "Confidence": "{:.3f}"}).highlight_min(subset=["MSE vs your digit"], color="#3a5a2a"), width="stretch")
+    basis = "the true label" if truth is not None else "the judge's reading of your original"
+    st.caption(f"'Correct' compares the judge's reading of each rebuild with {basis} ({ref}). The GAN has no input image, so it isn't scored on one digit — see the full scoreboard below.")
+
+    st.subheader("Full scoreboard — 2,000 test images")
     names = list(W["metrics_names"])
     tab = pd.DataFrame(W["metrics"], index=names, columns=["MSE", "Digit accuracy", "Mean confidence", "Distribution distance (TV)"])
     ae_like = tab.drop(index="GAN (generated)")
@@ -697,17 +783,27 @@ def page_comparison():
     st.caption("Mean judge probability of each digit over the 2,000 images produced by each model. The closer a model's bars are to the real data, the more faithfully it keeps the digit mix.")
 
 
-# ============================================================================= router
+# ============================================================================= main flow (one scrolling page)
+hero()
+st.divider()
+x, truth, imgid, src_label = input_block()
+pred = int(judge(x)[0].argmax())
+me = categorize(x, truth, pred)
+
 with st.sidebar:
     st.markdown("### 🔢 DeepDigit Studio")
+    show_digit(x, 120, src_label)
+    st.caption(f"Judge reads **{pred}**" + ("" if truth is None else f" · true label **{truth}**"))
+    st.caption("Change the digit at the top of the page — every section updates.")
+    st.divider()
     st.caption("Aryan Singh · Roll 69 · Batch C4\nDeep Learning II · 2026–27")
     st.caption("NumPy inference · weights from `train_numpy.py`")
 
-# Single page: all sections stacked one after another
-for _i, _section in enumerate((
-    page_overview, page_playground, page_probability, page_autoencoder, page_markov,
-    page_rbm, page_gan, page_mixing, page_comparison,
-)):
-    if _i:
-        st.divider()
-    _section()
+st.divider(); section_judge(x, truth)
+st.divider(); page_probability(me)
+st.divider(); page_autoencoder(x, truth, imgid)
+st.divider(); page_markov(x, truth, pred, imgid)
+st.divider(); page_rbm(x, truth, imgid)
+st.divider(); page_gan(x, truth, pred)
+st.divider(); page_mixing(x, truth, imgid)
+st.divider(); page_comparison(x, truth, pred)
